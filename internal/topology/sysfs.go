@@ -124,6 +124,13 @@ func cpuCachePath(cpuID int, index int, element string) string {
 	return filepath.Join(SysfsBasePath, "cpu"+strconv.Itoa(cpuID), "cache", "index"+strconv.Itoa(index), element)
 }
 
+// cpuCapacityPath returns path to CPU capacity file
+// e.g., /sys/devices/system/cpu/cpu0/cpu_capacity
+// Used to detect Intel hybrid P-cores vs E-cores (P-cores ~1024, E-cores ~600-750)
+func cpuCapacityPath(cpuID int) string {
+	return filepath.Join(SysfsBasePath, "cpu"+strconv.Itoa(cpuID), "cpu_capacity")
+}
+
 // ReadL3CacheID reads the L3 cache ID for a CPU
 // L3 cache is typically index3, shared by cores in the same CCD
 func ReadL3CacheID(cpuID int) (int, error) {

@@ -18,7 +18,7 @@ func PrintTopology(topo *topology.CPUTopology) {
 
 	var b strings.Builder
 
-	title := titleStyle.Render("🖥  AMD EPYC/Ryzen CPU Topology")
+	title := titleStyle.Render("Proxmox VE CPU Topology")
 	b.WriteString(title)
 	b.WriteString("\n\n")
 
@@ -33,27 +33,31 @@ func PrintTopology(topo *topology.CPUTopology) {
 	for _, pkg := range topo.Packages {
 		pkgCores := 0
 		pkgThreads := 0
-		for _, ccd := range pkg.CCDs {
-			pkgCores += len(ccd.PhysicalCPUs)
-			pkgThreads += len(ccd.AllCPUs)
+		for _, cg := range pkg.CoreGroups {
+			pkgCores += len(cg.PhysicalCPUs)
+			pkgThreads += len(cg.AllCPUs)
 		}
 		info.WriteString(fmt.Sprintf("  %s %d  %s\n",
 			packageStyle.Render("📦 Package"), pkg.ID,
 			dimStyle.Render(fmt.Sprintf("(%d cores, %d threads)", pkgCores, pkgThreads))))
 
-		for i, ccd := range pkg.CCDs {
+		for i, cg := range pkg.CoreGroups {
 			prefix := "├─"
-			if i == len(pkg.CCDs)-1 {
+			if i == len(pkg.CoreGroups)-1 {
 				prefix = "└─"
 			}
 			l3Info := ""
-			if ccd.L3CacheID >= 0 {
-				l3Info = dimStyle.Render(fmt.Sprintf(" [L3#%d]", ccd.L3CacheID))
+			if cg.L3CacheID >= 0 {
+				l3Info = dimStyle.Render(fmt.Sprintf(" [L3#%d]", cg.L3CacheID))
 			}
-			info.WriteString(fmt.Sprintf("     %s %s %d%s  ", prefix, ccdStyle.Render("CCD"), ccd.ID, l3Info))
-			info.WriteString(coreStyle.Render(affinity.FormatCPUs(ccd.PhysicalCPUs)))
+			label := cg.Name
+			if label == "" {
+				label = fmt.Sprintf("CCD %d", cg.ID)
+			}
+			info.WriteString(fmt.Sprintf("     %s %s%s  ", prefix, ccdStyle.Render(label), l3Info))
+			info.WriteString(coreStyle.Render(affinity.FormatCPUs(cg.PhysicalCPUs)))
 			info.WriteString(dimStyle.Render(" / "))
-			info.WriteString(vcpuStyle.Render(affinity.FormatCPUs(ccd.AllCPUs)))
+			info.WriteString(vcpuStyle.Render(affinity.FormatCPUs(cg.AllCPUs)))
 			info.WriteString("\n")
 		}
 	}

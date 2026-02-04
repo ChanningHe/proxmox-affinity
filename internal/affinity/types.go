@@ -10,6 +10,9 @@ const (
 	StrategySequential  Strategy = "sequential"
 	StrategyRandom      Strategy = "random"
 	StrategyManual      Strategy = "manual"
+	StrategyPCoresOnly  Strategy = "p-cores-only"
+	StrategyECoresOnly  Strategy = "e-cores-only"
+	StrategyAllCores    Strategy = "all-cores"
 )
 
 type Option struct {

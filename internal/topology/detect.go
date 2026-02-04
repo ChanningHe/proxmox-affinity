@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strings"
 )
 
 var ErrTopologyUnavailable = errors.New("topology unavailable")
@@ -46,6 +47,76 @@ func Detect() (*CPUTopology, error) {
 		infos = append(infos, *info)
 	}
 
+	arch := detectArchitecture(infos)
+
+	switch arch {
+	case ArchIntelHybrid:
+		return buildIntelHybridTopology(infos)
+	case ArchAMD:
+		return buildAMDTopology(infos)
+	default:
+		return buildGenericTopology(infos)
+	}
+}
+
+func detectArchitecture(cpus []CPUInfo) Architecture {
+	vendor := readCPUVendor()
+
+	switch vendor {
+	case "AuthenticAMD", "AMD":
+		return ArchAMD
+	case "GenuineIntel":
+		if hasHybridCores(cpus) {
+			return ArchIntelHybrid
+		}
+		return ArchGeneric
+	default:
+		if hasMultipleL3(cpus) {
+			return ArchAMD
+		}
+		return ArchGeneric
+	}
+}
+
+func readCPUVendor() string {
+	data, err := os.ReadFile("/proc/cpuinfo")
+	if err != nil {
+		return ""
+	}
+
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		if strings.HasPrefix(line, "vendor_id") {
+			parts := strings.SplitN(line, ":", 2)
+			if len(parts) == 2 {
+				return strings.TrimSpace(parts[1])
+			}
+		}
+	}
+	return ""
+}
+
+func hasHybridCores(cpus []CPUInfo) bool {
+	capacities := make(map[int]bool)
+	for _, cpu := range cpus {
+		if cpu.Capacity > 0 {
+			capacities[cpu.Capacity] = true
+		}
+	}
+	return len(capacities) > 1
+}
+
+func hasMultipleL3(cpus []CPUInfo) bool {
+	l3Values := make(map[int]bool)
+	for _, cpu := range cpus {
+		if cpu.L3CacheID >= 0 {
+			l3Values[cpu.L3CacheID] = true
+		}
+	}
+	return len(l3Values) > 1
+}
+
+func buildAMDTopology(infos []CPUInfo) (*CPUTopology, error) {
 	totalCPUs := len(infos)
 	totalCores := 0
 	for _, info := range infos {
@@ -56,11 +127,11 @@ func Detect() (*CPUTopology, error) {
 	hasSMT := totalCPUs > totalCores
 
 	method := detectCCDMethod(infos)
-	ccds := groupByCCD(infos, method)
+	coreGroups := groupByCCD(infos, method)
 
-	packageMap := make(map[int][]CCD)
-	for _, ccd := range ccds {
-		packageMap[ccd.PackageID] = append(packageMap[ccd.PackageID], ccd)
+	packageMap := make(map[int][]CoreGroup)
+	for _, cg := range coreGroups {
+		packageMap[cg.PackageID] = append(packageMap[cg.PackageID], cg)
 	}
 
 	packageIDs := make([]int, 0, len(packageMap))
@@ -71,20 +142,108 @@ func Detect() (*CPUTopology, error) {
 
 	packages := make([]Package, 0, len(packageIDs))
 	for _, id := range packageIDs {
-		packageCCDs := packageMap[id]
-		sort.Slice(packageCCDs, func(i, j int) bool {
-			return packageCCDs[i].ID < packageCCDs[j].ID
+		pkgGroups := packageMap[id]
+		sort.Slice(pkgGroups, func(i, j int) bool {
+			return pkgGroups[i].ID < pkgGroups[j].ID
 		})
-		packages = append(packages, Package{ID: id, CCDs: packageCCDs})
+		packages = append(packages, Package{ID: id, CoreGroups: pkgGroups})
 	}
 
 	return &CPUTopology{
+		Architecture: ArchAMD,
 		TotalCPUs:    totalCPUs,
 		TotalCores:   totalCores,
 		HasSMT:       hasSMT,
 		Packages:     packages,
-		CCDs:         ccds,
+		CoreGroups:   coreGroups,
 		DetectMethod: method,
+	}, nil
+}
+
+func buildIntelHybridTopology(infos []CPUInfo) (*CPUTopology, error) {
+	totalCPUs := len(infos)
+	totalCores := 0
+	for _, info := range infos {
+		if info.IsFirstThread {
+			totalCores++
+		}
+	}
+	hasSMT := totalCPUs > totalCores
+
+	coreGroups := groupByIntelCoreType(infos)
+
+	packageMap := make(map[int][]CoreGroup)
+	for _, cg := range coreGroups {
+		packageMap[cg.PackageID] = append(packageMap[cg.PackageID], cg)
+	}
+
+	packageIDs := make([]int, 0, len(packageMap))
+	for id := range packageMap {
+		packageIDs = append(packageIDs, id)
+	}
+	sort.Ints(packageIDs)
+
+	packages := make([]Package, 0, len(packageIDs))
+	for _, id := range packageIDs {
+		pkgGroups := packageMap[id]
+		sort.Slice(pkgGroups, func(i, j int) bool {
+			if pkgGroups[i].Type != pkgGroups[j].Type {
+				return pkgGroups[i].Type == CoreTypePerformance
+			}
+			return pkgGroups[i].ID < pkgGroups[j].ID
+		})
+		packages = append(packages, Package{ID: id, CoreGroups: pkgGroups})
+	}
+
+	return &CPUTopology{
+		Architecture: ArchIntelHybrid,
+		TotalCPUs:    totalCPUs,
+		TotalCores:   totalCores,
+		HasSMT:       hasSMT,
+		Packages:     packages,
+		CoreGroups:   coreGroups,
+		DetectMethod: "intel_hybrid",
+	}, nil
+}
+
+func buildGenericTopology(infos []CPUInfo) (*CPUTopology, error) {
+	totalCPUs := len(infos)
+	totalCores := 0
+	for _, info := range infos {
+		if info.IsFirstThread {
+			totalCores++
+		}
+	}
+	hasSMT := totalCPUs > totalCores
+
+	coreGroup := CoreGroup{
+		ID:        0,
+		PackageID: 0,
+		Type:      CoreTypeUnknown,
+		Name:      "All Cores",
+		L3CacheID: -1,
+	}
+
+	for _, info := range infos {
+		coreGroup.AllCPUs = append(coreGroup.AllCPUs, info.ID)
+		if info.IsFirstThread {
+			coreGroup.PhysicalCPUs = append(coreGroup.PhysicalCPUs, info.ID)
+		}
+	}
+	sort.Ints(coreGroup.AllCPUs)
+	sort.Ints(coreGroup.PhysicalCPUs)
+
+	coreGroups := []CoreGroup{coreGroup}
+	packages := []Package{{ID: 0, CoreGroups: coreGroups}}
+
+	return &CPUTopology{
+		Architecture: ArchGeneric,
+		TotalCPUs:    totalCPUs,
+		TotalCores:   totalCores,
+		HasSMT:       hasSMT,
+		Packages:     packages,
+		CoreGroups:   coreGroups,
+		DetectMethod: "generic",
 	}, nil
 }
 
@@ -106,7 +265,6 @@ func readCPUInfo(cpuID int) (*CPUInfo, error) {
 		return nil, err
 	}
 
-	// Read L3 cache ID - this is the most accurate way to detect CCD
 	l3CacheID, _ := ReadL3CacheID(cpuID)
 
 	siblings, err := readOptionalList(cpuPath(cpuID, "thread_siblings_list"), []int{cpuID})
@@ -115,6 +273,9 @@ func readCPUInfo(cpuID int) (*CPUInfo, error) {
 	}
 	sort.Ints(siblings)
 	siblings = dedupeSorted(siblings)
+
+	capacity := readCPUCapacity(cpuID)
+	coreType := detectCoreType(cpuID, capacity, siblings)
 
 	info := &CPUInfo{
 		ID:             cpuID,
@@ -125,16 +286,101 @@ func readCPUInfo(cpuID int) (*CPUInfo, error) {
 		L3CacheID:      l3CacheID,
 		ThreadSiblings: siblings,
 		IsFirstThread:  len(siblings) == 0 || cpuID == siblings[0],
+		CoreType:       coreType,
+		Capacity:       capacity,
 	}
 	return info, nil
 }
 
-func groupByCCD(cpus []CPUInfo, method string) []CCD {
+func readCPUCapacity(cpuID int) int {
+	path := cpuCapacityPath(cpuID)
+	value, err := ReadIntFile(path)
+	if err != nil {
+		return 0
+	}
+	return value
+}
+
+func detectCoreType(cpuID int, capacity int, siblings []int) CoreType {
+	if capacity >= 1000 {
+		return CoreTypePerformance
+	}
+	if capacity > 0 && capacity < 900 {
+		return CoreTypeEfficiency
+	}
+
+	return CoreTypeUnknown
+}
+
+func groupByIntelCoreType(cpus []CPUInfo) []CoreGroup {
+	pCores := CoreGroup{
+		ID:        0,
+		Type:      CoreTypePerformance,
+		Name:      "P-Cores",
+		L3CacheID: -1,
+	}
+	eCores := CoreGroup{
+		ID:        1,
+		Type:      CoreTypeEfficiency,
+		Name:      "E-Cores",
+		L3CacheID: -1,
+	}
+
+	for _, cpu := range cpus {
+		if cpu.PackageID > pCores.PackageID {
+			pCores.PackageID = cpu.PackageID
+		}
+		if cpu.PackageID > eCores.PackageID {
+			eCores.PackageID = cpu.PackageID
+		}
+
+		if cpu.CoreType == CoreTypePerformance {
+			pCores.AllCPUs = append(pCores.AllCPUs, cpu.ID)
+			if cpu.IsFirstThread {
+				pCores.PhysicalCPUs = append(pCores.PhysicalCPUs, cpu.ID)
+			}
+		} else if cpu.CoreType == CoreTypeEfficiency {
+			eCores.AllCPUs = append(eCores.AllCPUs, cpu.ID)
+			if cpu.IsFirstThread {
+				eCores.PhysicalCPUs = append(eCores.PhysicalCPUs, cpu.ID)
+			}
+		} else {
+			if len(cpu.ThreadSiblings) > 1 {
+				pCores.AllCPUs = append(pCores.AllCPUs, cpu.ID)
+				if cpu.IsFirstThread {
+					pCores.PhysicalCPUs = append(pCores.PhysicalCPUs, cpu.ID)
+				}
+			} else {
+				eCores.AllCPUs = append(eCores.AllCPUs, cpu.ID)
+				if cpu.IsFirstThread {
+					eCores.PhysicalCPUs = append(eCores.PhysicalCPUs, cpu.ID)
+				}
+			}
+		}
+	}
+
+	sort.Ints(pCores.AllCPUs)
+	sort.Ints(pCores.PhysicalCPUs)
+	sort.Ints(eCores.AllCPUs)
+	sort.Ints(eCores.PhysicalCPUs)
+
+	var groups []CoreGroup
+	if len(pCores.PhysicalCPUs) > 0 {
+		groups = append(groups, pCores)
+	}
+	if len(eCores.PhysicalCPUs) > 0 {
+		groups = append(groups, eCores)
+	}
+
+	return groups
+}
+
+func groupByCCD(cpus []CPUInfo, method string) []CoreGroup {
 	type key struct {
 		pkgID int
 		ccdID int
 	}
-	groups := make(map[key]*CCD)
+	groups := make(map[key]*CoreGroup)
 
 	for _, cpu := range cpus {
 		ccdID := 0
@@ -148,35 +394,36 @@ func groupByCCD(cpus []CPUInfo, method string) []CCD {
 		case "die_id":
 			ccdID = cpu.DieID
 		default:
-			// Inferred: group by core_id ranges
 			if defaultCoresPerCCD > 0 {
 				ccdID = cpu.CoreID / defaultCoresPerCCD
 			}
 		}
 
 		groupKey := key{pkgID: cpu.PackageID, ccdID: ccdID}
-		ccd, exists := groups[groupKey]
+		cg, exists := groups[groupKey]
 		if !exists {
-			ccd = &CCD{
+			cg = &CoreGroup{
 				ID:        ccdID,
 				PackageID: cpu.PackageID,
+				Type:      CoreTypeUnknown,
+				Name:      fmt.Sprintf("CCD %d", ccdID),
 				L3CacheID: l3ID,
 			}
-			groups[groupKey] = ccd
+			groups[groupKey] = cg
 		}
-		ccd.AllCPUs = append(ccd.AllCPUs, cpu.ID)
+		cg.AllCPUs = append(cg.AllCPUs, cpu.ID)
 		if cpu.IsFirstThread {
-			ccd.PhysicalCPUs = append(ccd.PhysicalCPUs, cpu.ID)
+			cg.PhysicalCPUs = append(cg.PhysicalCPUs, cpu.ID)
 		}
 	}
 
-	list := make([]CCD, 0, len(groups))
-	for _, ccd := range groups {
-		sort.Ints(ccd.AllCPUs)
-		ccd.AllCPUs = dedupeSorted(ccd.AllCPUs)
-		sort.Ints(ccd.PhysicalCPUs)
-		ccd.PhysicalCPUs = dedupeSorted(ccd.PhysicalCPUs)
-		list = append(list, *ccd)
+	list := make([]CoreGroup, 0, len(groups))
+	for _, cg := range groups {
+		sort.Ints(cg.AllCPUs)
+		cg.AllCPUs = dedupeSorted(cg.AllCPUs)
+		sort.Ints(cg.PhysicalCPUs)
+		cg.PhysicalCPUs = dedupeSorted(cg.PhysicalCPUs)
+		list = append(list, *cg)
 	}
 
 	sort.Slice(list, func(i, j int) bool {
@@ -186,10 +433,10 @@ func groupByCCD(cpus []CPUInfo, method string) []CCD {
 		return list[i].PackageID < list[j].PackageID
 	})
 
-	// Re-number CCDs sequentially per package for cleaner display
 	pkgCCDCount := make(map[int]int)
 	for i := range list {
 		list[i].ID = pkgCCDCount[list[i].PackageID]
+		list[i].Name = fmt.Sprintf("CCD %d", list[i].ID)
 		pkgCCDCount[list[i].PackageID]++
 	}
 
@@ -201,7 +448,6 @@ func detectCCDMethod(cpus []CPUInfo) string {
 		return "inferred"
 	}
 
-	// Priority 1: L3 Cache ID (most accurate for CCD detection)
 	hasL3 := true
 	l3Values := make(map[int]bool)
 	for _, cpu := range cpus {
@@ -211,12 +457,10 @@ func detectCCDMethod(cpus []CPUInfo) string {
 		}
 		l3Values[cpu.L3CacheID] = true
 	}
-	// Only use L3 if we have multiple distinct L3 caches (indicates multiple CCDs)
 	if hasL3 && len(l3Values) > 1 {
 		return "l3_cache"
 	}
 
-	// Priority 2: cluster_id
 	hasCluster := true
 	for _, cpu := range cpus {
 		if cpu.ClusterID < 0 {
@@ -228,7 +472,6 @@ func detectCCDMethod(cpus []CPUInfo) string {
 		return "cluster_id"
 	}
 
-	// Priority 3: die_id
 	hasDie := true
 	for _, cpu := range cpus {
 		if cpu.DieID < 0 {

@@ -61,7 +61,7 @@ func NewModel(topo *topology.CPUTopology) Model {
 		topo:         topo,
 		step:         stepCoreType,
 		textInput:    ti,
-		selectedCCDs: make([]bool, len(topo.CCDs)),
+		selectedCCDs: make([]bool, len(topo.CoreGroups)),
 		width:        80,
 		height:       24,
 	}
@@ -145,9 +145,9 @@ func (m Model) moveCursor(delta int) Model {
 	case stepManualCCD:
 		m.selectedOpt += delta
 		if m.selectedOpt < 0 {
-			m.selectedOpt = len(m.topo.CCDs) - 1
+			m.selectedOpt = len(m.topo.CoreGroups) - 1
 		}
-		if m.selectedOpt >= len(m.topo.CCDs) {
+		if m.selectedOpt >= len(m.topo.CoreGroups) {
 			m.selectedOpt = 0
 		}
 	case stepAction:
@@ -212,7 +212,7 @@ func (m Model) handleEnter() (tea.Model, tea.Cmd) {
 		selected := m.options[m.selectedOpt]
 
 		if selected.Strategy == affinity.StrategyManual {
-			m.selectedCCDs = make([]bool, len(m.topo.CCDs))
+			m.selectedCCDs = make([]bool, len(m.topo.CoreGroups))
 			m.selectedOpt = 0
 			m.step = stepManualCCD
 			return m, nil
@@ -361,41 +361,52 @@ func (m Model) renderHelp() string {
 func (m Model) renderTopology() string {
 	var b strings.Builder
 
-	b.WriteString(titleStyle.Render(" AMD EPYC/Ryzen CCD Affinity Tool "))
+	b.WriteString(titleStyle.Render(" Proxmox VE CPU Affinity Tool "))
 	b.WriteString("\n\n")
 
-	b.WriteString(fmt.Sprintf("  %s %d    %s %d    %s %s    %s %s\n",
+	archLabel := string(m.topo.Architecture)
+	if m.topo.Architecture == topology.ArchIntelHybrid {
+		archLabel = "Intel Hybrid"
+	} else if m.topo.Architecture == topology.ArchAMD {
+		archLabel = "AMD"
+	}
+
+	b.WriteString(fmt.Sprintf("  %s %s    %s %d    %s %d    %s %s\n",
+		dimStyle.Render("Arch:"), highlightStyle.Render(archLabel),
 		packageStyle.Render("Cores:"), m.topo.TotalCores,
 		vcpuStyle.Render("vCPUs:"), m.topo.TotalCPUs,
-		dimStyle.Render("SMT:"), formatBool(m.topo.HasSMT),
-		dimStyle.Render("Method:"), highlightStyle.Render(m.topo.DetectMethod)))
+		dimStyle.Render("SMT:"), formatBool(m.topo.HasSMT)))
 	b.WriteString("\n")
 
 	for _, pkg := range m.topo.Packages {
 		pkgCores := 0
 		pkgThreads := 0
-		for _, ccd := range pkg.CCDs {
-			pkgCores += len(ccd.PhysicalCPUs)
-			pkgThreads += len(ccd.AllCPUs)
+		for _, cg := range pkg.CoreGroups {
+			pkgCores += len(cg.PhysicalCPUs)
+			pkgThreads += len(cg.AllCPUs)
 		}
 
 		b.WriteString(fmt.Sprintf("  %s %d  %s\n",
 			packageStyle.Render("Package"), pkg.ID,
 			dimStyle.Render(fmt.Sprintf("(%d cores, %d threads)", pkgCores, pkgThreads))))
 
-		for i, ccd := range pkg.CCDs {
+		for i, cg := range pkg.CoreGroups {
 			prefix := "├─"
-			if i == len(pkg.CCDs)-1 {
+			if i == len(pkg.CoreGroups)-1 {
 				prefix = "└─"
 			}
 			l3Info := ""
-			if ccd.L3CacheID >= 0 {
-				l3Info = dimStyle.Render(fmt.Sprintf(" [L3#%d]", ccd.L3CacheID))
+			if cg.L3CacheID >= 0 {
+				l3Info = dimStyle.Render(fmt.Sprintf(" [L3#%d]", cg.L3CacheID))
 			}
-			b.WriteString(fmt.Sprintf("     %s %s %d%s  ", prefix, ccdStyle.Render("CCD"), ccd.ID, l3Info))
-			b.WriteString(coreStyle.Render(affinity.FormatCPUs(ccd.PhysicalCPUs)))
+			label := cg.Name
+			if label == "" {
+				label = fmt.Sprintf("CCD %d", cg.ID)
+			}
+			b.WriteString(fmt.Sprintf("     %s %s%s  ", prefix, ccdStyle.Render(label), l3Info))
+			b.WriteString(coreStyle.Render(affinity.FormatCPUs(cg.PhysicalCPUs)))
 			b.WriteString(dimStyle.Render(" / "))
-			b.WriteString(vcpuStyle.Render(affinity.FormatCPUs(ccd.AllCPUs)))
+			b.WriteString(vcpuStyle.Render(affinity.FormatCPUs(cg.AllCPUs)))
 			b.WriteString("\n")
 		}
 	}
@@ -511,12 +522,17 @@ func (m Model) renderManualCCDSelection() string {
 		}
 	}
 
-	b.WriteString(subtitleStyle.Render(fmt.Sprintf("? Select %d CCDs", m.minCCDsNeeded)))
+	groupName := "CCDs"
+	if m.topo.Architecture == topology.ArchIntelHybrid {
+		groupName = "core groups"
+	}
+
+	b.WriteString(subtitleStyle.Render(fmt.Sprintf("? Select %d %s", m.minCCDsNeeded, groupName)))
 	b.WriteString("\n")
 	b.WriteString(dimStyle.Render(fmt.Sprintf("  Selected: %d / %d required", selectedCount, m.minCCDsNeeded)))
 	b.WriteString("\n\n")
 
-	for i, ccd := range m.topo.CCDs {
+	for i, cg := range m.topo.CoreGroups {
 		checkbox := "[ ]"
 		if m.selectedCCDs[i] {
 			checkbox = coreStyle.Render("[✓]")
@@ -528,17 +544,21 @@ func (m Model) renderManualCCDSelection() string {
 			b.WriteString("    ")
 		}
 
-		b.WriteString(fmt.Sprintf("%s CCD %d  %s / %s",
+		label := cg.Name
+		if label == "" {
+			label = fmt.Sprintf("CCD %d", cg.ID)
+		}
+		b.WriteString(fmt.Sprintf("%s %s  %s / %s",
 			checkbox,
-			ccd.ID,
-			coreStyle.Render(affinity.FormatCPUs(ccd.PhysicalCPUs)),
-			vcpuStyle.Render(affinity.FormatCPUs(ccd.AllCPUs))))
+			label,
+			coreStyle.Render(affinity.FormatCPUs(cg.PhysicalCPUs)),
+			vcpuStyle.Render(affinity.FormatCPUs(cg.AllCPUs))))
 		b.WriteString("\n")
 	}
 
 	if selectedCount < m.minCCDsNeeded {
 		b.WriteString("\n")
-		b.WriteString(highlightStyle.Render(fmt.Sprintf("  Need %d more CCD(s)", m.minCCDsNeeded-selectedCount)))
+		b.WriteString(highlightStyle.Render(fmt.Sprintf("  Need %d more", m.minCCDsNeeded-selectedCount)))
 	}
 
 	return b.String()

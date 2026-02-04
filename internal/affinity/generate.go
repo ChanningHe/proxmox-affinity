@@ -30,6 +30,15 @@ func Generate(req *Request) ([]Option, error) {
 			physicalCoresNeeded, req.CoresNeeded, req.Topology.TotalCores)
 	}
 
+	switch req.Topology.Architecture {
+	case topology.ArchIntelHybrid:
+		return generateIntelOptions(req, physicalCoresNeeded)
+	default:
+		return generateAMDOptions(req, physicalCoresNeeded)
+	}
+}
+
+func generateAMDOptions(req *Request, physicalCoresNeeded int) ([]Option, error) {
 	options := []Option{
 		*generateSingleCCD(req, physicalCoresNeeded),
 		*generateDistributed(req, physicalCoresNeeded),
@@ -45,6 +54,84 @@ func Generate(req *Request) ([]Option, error) {
 	return options, nil
 }
 
+func generateIntelOptions(req *Request, physicalCoresNeeded int) ([]Option, error) {
+	options := []Option{
+		*generatePCoresOnly(req, physicalCoresNeeded),
+		*generateECoresOnly(req, physicalCoresNeeded),
+		*generateAllCores(req, physicalCoresNeeded),
+		*generateSequential(req, physicalCoresNeeded),
+		*generateManualPlaceholder(req, physicalCoresNeeded),
+	}
+
+	for i := range options {
+		options[i].AffinityStr = FormatCPUs(options[i].CPUs)
+	}
+
+	return options, nil
+}
+
+func generatePCoresOnly(req *Request, physicalCoresNeeded int) *Option {
+	option := &Option{
+		Strategy:    StrategyPCoresOnly,
+		Name:        "P-Cores Only",
+		Description: "Use only Performance cores (best single-thread)",
+	}
+
+	pCores := req.Topology.GetPCoresCPUs()
+	if len(pCores) < physicalCoresNeeded {
+		option.Description = fmt.Sprintf("Unavailable: only %d P-cores, need %d", len(pCores), physicalCoresNeeded)
+		return option
+	}
+
+	selectedPhysical := pCores[:physicalCoresNeeded]
+	option.CPUs = expandToVCPUs(selectedPhysical, req.IncludeSMT, req.Topology)
+	option.CCDsUsed = 1
+	return option
+}
+
+func generateECoresOnly(req *Request, physicalCoresNeeded int) *Option {
+	option := &Option{
+		Strategy:    StrategyECoresOnly,
+		Name:        "E-Cores Only",
+		Description: "Use only Efficiency cores (power efficient)",
+	}
+
+	eCores := req.Topology.GetECoresCPUs()
+	if len(eCores) < physicalCoresNeeded {
+		option.Description = fmt.Sprintf("Unavailable: only %d E-cores, need %d", len(eCores), physicalCoresNeeded)
+		return option
+	}
+
+	selectedPhysical := eCores[:physicalCoresNeeded]
+	option.CPUs = expandToVCPUs(selectedPhysical, req.IncludeSMT, req.Topology)
+	option.CCDsUsed = 1
+	return option
+}
+
+func generateAllCores(req *Request, physicalCoresNeeded int) *Option {
+	option := &Option{
+		Strategy:    StrategyAllCores,
+		Name:        "All Cores",
+		Description: "Use both P-cores and E-cores (maximum throughput)",
+	}
+
+	pCores := req.Topology.GetPCoresCPUs()
+	eCores := req.Topology.GetECoresCPUs()
+
+	selectedPhysical := make([]int, 0, physicalCoresNeeded)
+	selectedPhysical = append(selectedPhysical, pCores...)
+	selectedPhysical = append(selectedPhysical, eCores...)
+	sort.Ints(selectedPhysical)
+
+	if len(selectedPhysical) > physicalCoresNeeded {
+		selectedPhysical = selectedPhysical[:physicalCoresNeeded]
+	}
+
+	option.CPUs = expandToVCPUs(selectedPhysical, req.IncludeSMT, req.Topology)
+	option.CCDsUsed = countCCDsUsedByPhysical(selectedPhysical, req.Topology)
+	return option
+}
+
 func generateSingleCCD(req *Request, physicalCoresNeeded int) *Option {
 	option := &Option{
 		Strategy:    StrategySingleCCD,
@@ -52,10 +139,10 @@ func generateSingleCCD(req *Request, physicalCoresNeeded int) *Option {
 		Description: "All cores from one CCD (best cache locality)",
 	}
 
-	for _, ccd := range req.Topology.CCDs {
-		if len(ccd.PhysicalCPUs) >= physicalCoresNeeded {
+	for _, cg := range req.Topology.CoreGroups {
+		if len(cg.PhysicalCPUs) >= physicalCoresNeeded {
 			physicalCores := make([]int, physicalCoresNeeded)
-			copy(physicalCores, ccd.PhysicalCPUs[:physicalCoresNeeded])
+			copy(physicalCores, cg.PhysicalCPUs[:physicalCoresNeeded])
 
 			option.CPUs = expandToVCPUs(physicalCores, req.IncludeSMT, req.Topology)
 			option.CCDsUsed = 1
@@ -74,21 +161,21 @@ func generateDistributed(req *Request, physicalCoresNeeded int) *Option {
 		Description: "Spread cores across CCDs",
 	}
 
-	ccds := sortedCCDs(req.Topology.CCDs)
+	coreGroups := sortedCoreGroups(req.Topology.CoreGroups)
 	selectedPhysical := make([]int, 0, physicalCoresNeeded)
 	usedCCDs := make(map[int]struct{})
-	positions := make([]int, len(ccds))
+	positions := make([]int, len(coreGroups))
 
 	for len(selectedPhysical) < physicalCoresNeeded {
 		progress := false
-		for i, ccd := range ccds {
+		for i, cg := range coreGroups {
 			if len(selectedPhysical) >= physicalCoresNeeded {
 				break
 			}
-			if positions[i] >= len(ccd.PhysicalCPUs) {
+			if positions[i] >= len(cg.PhysicalCPUs) {
 				continue
 			}
-			selectedPhysical = append(selectedPhysical, ccd.PhysicalCPUs[positions[i]])
+			selectedPhysical = append(selectedPhysical, cg.PhysicalCPUs[positions[i]])
 			positions[i]++
 			usedCCDs[i] = struct{}{}
 			progress = true
@@ -128,20 +215,20 @@ func generateRandom(req *Request, physicalCoresNeeded int) *Option {
 		Description: "Randomly select from minimum CCDs needed",
 	}
 
-	ccds := req.Topology.CCDs
-	if len(ccds) == 0 {
+	coreGroups := req.Topology.CoreGroups
+	if len(coreGroups) == 0 {
 		return option
 	}
 
-	coresPerCCD := len(ccds[0].PhysicalCPUs)
+	coresPerCCD := len(coreGroups[0].PhysicalCPUs)
 	minCCDsNeeded := (physicalCoresNeeded + coresPerCCD - 1) / coresPerCCD
 
-	if minCCDsNeeded > len(ccds) {
-		minCCDsNeeded = len(ccds)
+	if minCCDsNeeded > len(coreGroups) {
+		minCCDsNeeded = len(coreGroups)
 	}
 
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
-	ccdIndices := make([]int, len(ccds))
+	ccdIndices := make([]int, len(coreGroups))
 	for i := range ccdIndices {
 		ccdIndices[i] = i
 	}
@@ -154,8 +241,8 @@ func generateRandom(req *Request, physicalCoresNeeded int) *Option {
 
 	selectedPhysical := make([]int, 0, physicalCoresNeeded)
 	for _, ccdIdx := range selectedCCDs {
-		ccd := ccds[ccdIdx]
-		for _, phys := range ccd.PhysicalCPUs {
+		cg := coreGroups[ccdIdx]
+		for _, phys := range cg.PhysicalCPUs {
 			if len(selectedPhysical) >= physicalCoresNeeded {
 				break
 			}
@@ -169,10 +256,10 @@ func generateRandom(req *Request, physicalCoresNeeded int) *Option {
 }
 
 func generateManualPlaceholder(req *Request, physicalCoresNeeded int) *Option {
-	ccds := req.Topology.CCDs
+	coreGroups := req.Topology.CoreGroups
 	coresPerCCD := 0
-	if len(ccds) > 0 {
-		coresPerCCD = len(ccds[0].PhysicalCPUs)
+	if len(coreGroups) > 0 {
+		coresPerCCD = len(coreGroups[0].PhysicalCPUs)
 	}
 	minCCDsNeeded := 1
 	if coresPerCCD > 0 {
@@ -200,16 +287,16 @@ func GenerateManual(req *Request, selectedCCDIndices []int) (*Option, error) {
 		physicalCoresNeeded = (req.CoresNeeded + 1) / 2
 	}
 
-	ccds := req.Topology.CCDs
+	coreGroups := req.Topology.CoreGroups
 	sort.Ints(selectedCCDIndices)
 
 	selectedPhysical := make([]int, 0, physicalCoresNeeded)
 	for _, ccdIdx := range selectedCCDIndices {
-		if ccdIdx < 0 || ccdIdx >= len(ccds) {
+		if ccdIdx < 0 || ccdIdx >= len(coreGroups) {
 			continue
 		}
-		ccd := ccds[ccdIdx]
-		for _, phys := range ccd.PhysicalCPUs {
+		cg := coreGroups[ccdIdx]
+		for _, phys := range cg.PhysicalCPUs {
 			if len(selectedPhysical) >= physicalCoresNeeded {
 				break
 			}
@@ -233,10 +320,10 @@ func GenerateManual(req *Request, selectedCCDIndices []int) (*Option, error) {
 }
 
 func MinCCDsNeeded(topo *topology.CPUTopology, physicalCoresNeeded int) int {
-	if len(topo.CCDs) == 0 {
+	if len(topo.CoreGroups) == 0 {
 		return 0
 	}
-	coresPerCCD := len(topo.CCDs[0].PhysicalCPUs)
+	coresPerCCD := len(topo.CoreGroups[0].PhysicalCPUs)
 	if coresPerCCD == 0 {
 		return 0
 	}
@@ -252,12 +339,12 @@ func expandToVCPUs(physicalCores []int, includeSMT bool, topo *topology.CPUTopol
 	}
 
 	physicalToSiblings := make(map[int][]int)
-	for _, ccd := range topo.CCDs {
-		numPhysical := len(ccd.PhysicalCPUs)
-		for i, phys := range ccd.PhysicalCPUs {
+	for _, cg := range topo.CoreGroups {
+		numPhysical := len(cg.PhysicalCPUs)
+		for i, phys := range cg.PhysicalCPUs {
 			siblings := []int{phys}
-			if i+numPhysical < len(ccd.AllCPUs) {
-				siblings = append(siblings, ccd.AllCPUs[i+numPhysical])
+			if i+numPhysical < len(cg.AllCPUs) {
+				siblings = append(siblings, cg.AllCPUs[i+numPhysical])
 			}
 			physicalToSiblings[phys] = siblings
 		}
@@ -312,16 +399,16 @@ func formatRange(start, end int) string {
 
 func allPhysicalCPUsSorted(topo *topology.CPUTopology) []int {
 	var result []int
-	for _, ccd := range topo.CCDs {
-		result = append(result, ccd.PhysicalCPUs...)
+	for _, cg := range topo.CoreGroups {
+		result = append(result, cg.PhysicalCPUs...)
 	}
 	sort.Ints(result)
 	return dedupeSorted(result)
 }
 
-func sortedCCDs(ccds []topology.CCD) []topology.CCD {
-	list := make([]topology.CCD, len(ccds))
-	copy(list, ccds)
+func sortedCoreGroups(coreGroups []topology.CoreGroup) []topology.CoreGroup {
+	list := make([]topology.CoreGroup, len(coreGroups))
+	copy(list, coreGroups)
 	sort.Slice(list, func(i, j int) bool {
 		if list[i].PackageID == list[j].PackageID {
 			return list[i].ID < list[j].ID
@@ -338,8 +425,8 @@ func countCCDsUsedByPhysical(physicalCores []int, topo *topology.CPUTopology) in
 	}
 
 	usedCCDs := make(map[int]struct{})
-	for i, ccd := range topo.CCDs {
-		for _, p := range ccd.PhysicalCPUs {
+	for i, cg := range topo.CoreGroups {
+		for _, p := range cg.PhysicalCPUs {
 			if _, ok := physicalSet[p]; ok {
 				usedCCDs[i] = struct{}{}
 				break
